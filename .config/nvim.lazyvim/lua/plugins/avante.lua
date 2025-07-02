@@ -52,6 +52,24 @@ return {
       support_paste_from_clipboard = false,
     },
 
+    -- Custom mappings for better completion experience
+    mappings = {
+      ask = "<leader>aa",
+      edit = "<leader>ae",
+      refresh = "<leader>ar",
+      toggle = {
+        default = "<leader>at",
+        debug = "<leader>ad",
+        hint = "<leader>ah",
+      },
+      -- Ensure completion works in input
+      completion = {
+        accept = "<C-y>",
+        next = "<Tab>",
+        prev = "<S-Tab>",
+      },
+    },
+
     -- Disable features that might use repo mapping
     hints = { enabled = false },
     windows = {
@@ -141,4 +159,19 @@ return {
       ft = { "markdown", "Avante" },
     },
   },
+  -- Custom configuration for Avante input completion
+  config = function(_, opts)
+    require("avante").setup(opts)
+    
+    -- Set up custom keybindings for Avante input
+    vim.api.nvim_create_autocmd("FileType", {
+      pattern = "Avante*",
+      callback = function()
+        -- Map Ctrl+y to accept completion in Avante buffers
+        vim.keymap.set("i", "<C-y>", "<C-y>", { buffer = true, desc = "Accept completion" })
+        vim.keymap.set("i", "<Tab>", "<Tab>", { buffer = true, desc = "Next completion" })
+        vim.keymap.set("i", "<S-Tab>", "<S-Tab>", { buffer = true, desc = "Previous completion" })
+      end,
+    })
+  end,
 }
