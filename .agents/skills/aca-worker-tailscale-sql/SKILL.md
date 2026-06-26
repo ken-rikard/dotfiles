@@ -568,14 +568,96 @@ Secret:
 { name: 'netbird-setup-key', value: netbirdSetupKey }
 ```
 
-### Key unknowns to validate during testing
+### ⛔ nb01 test: daemon+client mode FAILS in ACA (confirmed 2026-06-25)
 
-1. **NetBird userspace mode on ACA** — confirm it starts successfully without `/dev/net/tun` or `CAP_NET_ADMIN`. The flag `--no-iface` or netbird's built-in wireguard-go path may need to be forced explicitly.
-2. **microsocks binary availability** — confirm the release URL is reachable from Docker build context, or switch to building from source.
-3. **Subnet route advertisement delay** — the 10 s warmup may need tuning. NetBird advertises routes via its management server; the peer on the LAN side must have the route approved in the admin panel.
-4. **proxychains4 + NetBird DNS** — NetBird may set up its own DNS resolver. Confirm `--accept-dns=false` equivalent flag, or ensure the resolver doesn't conflict with `remote_dns_subnet 224` in proxychains.conf.
-5. **microsocks and SOCKS5 auth** — microsocks supports optional username/password. The proxychains.conf `[ProxyList]` line would need to change to `socks5 127.0.0.1 1055 user pass` if auth is enabled.
-6. **`netbird status` command syntax** — verify the `--daemon-addr` flag and `Connected` grep string against the installed NetBird version.
+A connectivity test container was deployed to ACA (`cdm-net-syncservice-downloader-dev2`).
+Image: `plandockerapps.azurecr.io/cdm-net-netbird-test:nb01`, NetBird v0.73.2.
+
+**nb01 test was using the WRONG mode** — it started `netbird daemon &` then called
+`netbird up` (daemon+client architecture), which requires `/dev/net/tun` or
+`CAP_NET_ADMIN` to create any WireGuard interface. ACA provides neither.
+
+| Check (nb01 — daemon mode) | Result |
+|---|---|
+| `/dev/net/tun` available | ❌ NOT available |
+| `CAP_NET_ADMIN` granted | ❌ NOT granted |
+| NetBird daemon socket appeared | ❌ `/var/run/netbird.sock` never created |
+| SQL Server `10.16.150.6:1433` | ❌ UNREACHABLE |
+| PlanCRM / CRM Helper APIs | ❌ UNREACHABLE (false ✅ due to curl `|| echo "000"` bug) |
+
+**Root cause of nb01 failure**: The daemon requires either `/dev/net/tun` (wireguard-go userspace)
+or `CAP_NET_ADMIN` (kernel WireGuard) to create a WireGuard interface. Neither is available on ACA.
+
+**curl test script gotcha** (fixed in nb02): `curl -w "%{http_code}" ... || echo "000"`
+produces `"000000"` not `"000"` when curl times out — curl always writes `%{http_code}` via
+`-w` even on failure (outputs "000") AND exits non-zero, so `|| echo "000"` appends a second
+"000". The `!= "000"` check then produces a false ✅. Fix: remove the `|| echo "000"`.
+
+---
+
+### ✅ NETSTACK MODE — viable in ACA (to be confirmed by nb02)
+
+NetBird has had a **netstack mode** since v0.25.3 that uses **gVisor netstack** to run the
+entire WireGuard IP stack in userspace. **No `/dev/net/tun` and no `CAP_NET_ADMIN` required.**
+
+```bash
+# Two env vars + foreground flag = pure userspace, no kernel privileges
+NB_USE_NETSTACK_MODE=true
+NB_SOCKS5_LISTENER_PORT=1080
+netbird up --foreground-mode --setup-key <KEY> --management-url <URL>
+```
+
+| Property | Value |
+|---|---|
+| Requires `/dev/net/tun` | ❌ No |
+| Requires `CAP_NET_ADMIN` | ❌ No |
+| Mechanism | gVisor netstack (same as Tailscale `--tun=userspace-networking`) |
+| Networking mode | SOCKS5 proxy on `NB_SOCKS5_LISTENER_PORT` |
+| Foreground flag `-F` | Skips daemon socket — runs inline, no `/var/run/netbird.sock` |
+| DNS support | ❌ Not supported (IP-only routes) |
+
+For our use case (SQL + HTTP, all by IP) — DNS limitation does not matter.
+
+**Architecture with netstack mode:**
+```
+Container
+├── netbird (netstack+foreground)  → SOCKS5 on 127.0.0.1:1080
+│     └── routing peer on LAN
+│           ├── SQL Server:   10.16.150.6:1433
+│           ├── Plan CRM API: 10.16.150.16:8085
+│           └── CRM Helper:   10.16.150.16:8089
+│
+├── socat (via proxychains → SOCKS5)
+│     Listens on <eth0-IP>:14330 → 10.16.150.6:1433
+│
+└── dotnet worker
+      ├── SQL Server → socat tunnel (Server=<eth0-ip>,14330)
+      └── HTTP clients → HTTP_PROXY=socks5://127.0.0.1:1080
+```
+
+**Prerequisite that Tailscale doesn't need**: You need a NetBird **routing peer** on the
+on-premises LAN with subnet routes for `10.16.150.0/24` approved in the NetBird admin
+console. Tailscale only needs an exit node (any machine with `--advertise-exit-node`).
+
+**nb02 image** (`plandockerapps.azurecr.io/cdm-net-netbird-test:nb02`) tests this mode.
+All connectivity probes go via `curl --proxy socks5://127.0.0.1:1080`.
+
+**To deploy nb02 test:**
+```bash
+# Build
+podman build \
+  -f Backend/CDM.NET.SyncService/CDM.NET.SyncService.Worker.Downloader/netbird-test/Dockerfile \
+  -t plandockerapps.azurecr.io/cdm-net-netbird-test:nb02 \
+  Backend/CDM.NET.SyncService/CDM.NET.SyncService.Worker.Downloader/netbird-test
+
+# Push
+ACR_TOKEN=$(az acr login --name plandockerapps --expose-token --output tsv --query accessToken)
+podman login plandockerapps.azurecr.io --username 00000000-0000-0000-0000-000000000000 --password "$ACR_TOKEN"
+podman push plandockerapps.azurecr.io/cdm-net-netbird-test:nb02
+
+# Deploy (update image in the existing test Container App)
+NETBIRD_SETUP_KEY=<key> ./Backend/CDM.NET.SyncService/CDM.NET.SyncService.Worker.Downloader/netbird-test/deploy-test.sh nb02
+```
 
 ### Comparison with Tailscale version
 
@@ -591,7 +673,7 @@ Secret:
 | socat eth0 binding | Required | Required (same reason) |
 | `NO_PROXY` rules | Same | Same |
 | Connection string rewrite | Same `sed` | Same `sed` |
-| Tested on ACA | ✅ Confirmed working (dp33) | ⚠️ Not yet tested |
+| Tested on ACA | ✅ Confirmed working (dp33) | ✅ NETSTACK MODE viable (NB_USE_NETSTACK_MODE=true + -F); nb01 tested wrong mode (daemon, blocked); nb02 pending |
 
 ---
 
